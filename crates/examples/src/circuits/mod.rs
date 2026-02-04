@@ -7,6 +7,7 @@ pub mod blake2s;
 pub mod ethsign;
 pub mod hashsign;
 pub mod keccak;
+pub mod keccak_merkle_path;
 pub mod sha256;
 pub mod sha512;
 pub mod subset_sum;

@@ -3,6 +3,7 @@
 
 pub mod circuits;
 pub mod cli;
+pub mod resource_stats;
 pub mod snapshot;
 
 use anyhow::Result;
@@ -25,6 +26,8 @@ use binius_verifier::{
 use clap::ValueEnum;
 pub use cli::Cli;
 use digest::{Digest, FixedOutputReset, Output, core_api::BlockSizeUser};
+pub use resource_stats::{Phase, PhasedResourceStats, PhasedResourceTracker, ResourceStats, PEAK_ALLOC};
+use std::time::Instant;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum CompressionType {
@@ -54,12 +57,23 @@ pub fn setup_sha256(
 	let _setup_guard = tracing::info_span!("Setup", log_inv_rate).entered();
 	let parallel_compression = ParallelCompressionAdaptor::new(StdCompression::default());
 	let compression = parallel_compression.compression().clone();
+
+	let verifier_start = Instant::now();
 	let verifier = Verifier::setup(cs, log_inv_rate, compression)?;
+	let verifier_time = verifier_start.elapsed();
+	tracing::info!("Verifier setup completed in {:?}", verifier_time);
+
+	let prover_start = Instant::now();
 	let prover = if let Some(key_collection) = key_collection {
 		Prover::setup_with_key_collection(verifier.clone(), parallel_compression, key_collection)?
 	} else {
 		Prover::setup(verifier.clone(), parallel_compression)?
 	};
+	let prover_time = prover_start.elapsed();
+	tracing::info!("Prover setup completed in {:?}", prover_time);
+
+	tracing::info!("Total setup time: {:?}", verifier_time + prover_time);
+
 	Ok((verifier, prover))
 }
 
@@ -93,17 +107,46 @@ where
 	ParD: ParallelDigest<Digest = D>,
 	ParC: ParallelPseudoCompression<Output<D>, 2, Compression = C>,
 {
+	prove_verify_with_tracker(verifier, prover, witness, None)
+}
+
+/// Prove and verify with optional resource tracking for prove and verify phases.
+pub fn prove_verify_with_tracker<D, C, ParD, ParC>(
+	verifier: &Verifier<D, C>,
+	prover: &Prover<OptimalPackedB128, ParC, ParD>,
+	witness: ValueVec,
+	mut tracker: Option<&mut PhasedResourceTracker>,
+) -> Result<()>
+where
+	D: Digest + BlockSizeUser + FixedOutputReset,
+	C: PseudoCompressionFunction<Output<D>, 2>,
+	ParD: ParallelDigest<Digest = D>,
+	ParC: ParallelPseudoCompression<Output<D>, 2, Compression = C>,
+{
 	let challenger = StdChallenger::default();
 
+	// Prove phase
+	if let Some(ref mut t) = tracker {
+		t.start_phase(Phase::Prove);
+	}
 	let mut prover_transcript = ProverTranscript::new(challenger.clone());
 	prover.prove(witness.clone(), &mut prover_transcript)?;
-
 	let proof = prover_transcript.finalize();
 	tracing::info!("Proof size: {} KiB", proof.len() / 1024);
+	if let Some(ref mut t) = tracker {
+		t.end_phase();
+	}
 
+	// Verify phase
+	if let Some(ref mut t) = tracker {
+		t.start_phase(Phase::Verify);
+	}
 	let mut verifier_transcript = VerifierTranscript::new(challenger, proof);
 	verifier.verify(witness.public(), &mut verifier_transcript)?;
 	verifier_transcript.finalize()?;
+	if let Some(t) = tracker {
+		t.end_phase();
+	}
 
 	Ok(())
 }

@@ -7,7 +7,8 @@ use binius_frontend::{CircuitBuilder, CircuitStat};
 use binius_utils::serialization::{DeserializeBytes, SerializeBytes};
 use clap::{Arg, Args, Command, FromArgMatches, Subcommand};
 
-use crate::{CompressionType, ExampleCircuit, prove_verify, setup_sha256, setup_vision4};
+use crate::resource_stats::{Phase, PhasedResourceTracker};
+use crate::{CompressionType, ExampleCircuit, prove_verify_with_tracker, setup_sha256, setup_vision4};
 
 /// Serialize a value implementing `SerializeBytes` and write it to the given path.
 fn write_serialized<T: SerializeBytes>(value: &T, path: &str) -> Result<()> {
@@ -453,6 +454,9 @@ where
 	}
 
 	fn run_prove(matches: clap::ArgMatches) -> Result<()> {
+		// Start resource tracking
+		let mut resource_tracker = PhasedResourceTracker::new();
+
 		// Extract common arguments
 		let log_inv_rate = *matches
 			.get_one::<u32>("log_inv_rate")
@@ -468,6 +472,7 @@ where
 		let instance = E::Instance::from_arg_matches(&matches)?;
 
 		// Build the circuit
+		resource_tracker.start_phase(Phase::Build);
 		let build_scope = tracing::info_span!("Building circuit").entered();
 		let mut builder = CircuitBuilder::new();
 		let example = E::build(params, &mut builder)?;
@@ -491,19 +496,32 @@ where
 			.in_scope(|| circuit.populate_wire_witness(&mut filler))?;
 		let witness = filler.into_value_vec();
 		drop(witness_population);
+		resource_tracker.end_phase();
 
+		// Setup phase
+		resource_tracker.start_phase(Phase::Setup);
 		match compression {
 			CompressionType::Sha256 => {
 				tracing::info!("Using SHA256 compression for Merkle tree");
 				let (verifier, prover) = setup_sha256(cs, log_inv_rate as usize, None)?;
-				prove_verify(&verifier, &prover, witness)?;
+				resource_tracker.end_phase();
+
+				// Prove and verify phases (tracked internally)
+				prove_verify_with_tracker(&verifier, &prover, witness, Some(&mut resource_tracker))?;
 			}
 			CompressionType::Vision4 => {
 				tracing::info!("Using Vision4 compression for Merkle tree");
 				let (verifier, prover) = setup_vision4(cs, log_inv_rate as usize, None)?;
-				prove_verify(&verifier, &prover, witness)?;
+				resource_tracker.end_phase();
+
+				// Prove and verify phases (tracked internally)
+				prove_verify_with_tracker(&verifier, &prover, witness, Some(&mut resource_tracker))?;
 			}
 		}
+
+		// Print resource statistics
+		let stats = resource_tracker.finish();
+		println!("\n{}", stats);
 
 		Ok(())
 	}
@@ -634,6 +652,9 @@ where
 	}
 
 	fn run_load_prove(matches: clap::ArgMatches) -> Result<()> {
+		// Start resource tracking
+		let mut resource_tracker = PhasedResourceTracker::new();
+
 		// Extract file paths and parameters
 		let cs_path = matches
 			.get_one::<String>("cs_path")
@@ -652,6 +673,9 @@ where
 			.get_one::<CompressionType>("compression")
 			.expect("has default value")
 			.clone();
+
+		// Build phase (loading is part of build for load-prove)
+		resource_tracker.start_phase(Phase::Build);
 
 		// Load constraint system
 		let cs_load_scope = tracing::info_span!("Loading constraint system").entered();
@@ -688,21 +712,34 @@ where
 			non_pub_data.into_owned(),
 		)?;
 		drop(witness_load_scope);
+		resource_tracker.end_phase();
 
+		// Setup phase
+		resource_tracker.start_phase(Phase::Setup);
 		match compression {
 			CompressionType::Sha256 => {
 				tracing::info!("Using SHA256 compression for Merkle tree");
 				let (verifier, prover) =
 					setup_sha256(cs, log_inv_rate as usize, maybe_key_collection)?;
-				prove_verify(&verifier, &prover, witness)?;
+				resource_tracker.end_phase();
+
+				// Prove and verify phases (tracked internally)
+				prove_verify_with_tracker(&verifier, &prover, witness, Some(&mut resource_tracker))?;
 			}
 			CompressionType::Vision4 => {
 				tracing::info!("Using Vision4 compression for Merkle tree");
 				let (verifier, prover) =
 					setup_vision4(cs, log_inv_rate as usize, maybe_key_collection)?;
-				prove_verify(&verifier, &prover, witness)?;
+				resource_tracker.end_phase();
+
+				// Prove and verify phases (tracked internally)
+				prove_verify_with_tracker(&verifier, &prover, witness, Some(&mut resource_tracker))?;
 			}
 		};
+
+		// Print resource statistics
+		let stats = resource_tracker.finish();
+		println!("\n{}", stats);
 
 		Ok(())
 	}
